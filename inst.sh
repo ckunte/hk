@@ -107,7 +107,8 @@ fi
 
 # --- 4. Extract (only the binary, and only if it's a plain top-level file) -
 printf 'Extracting archive... '
-MEMBER="$(tar -tzf "$WORKDIR/$ARCHIVE" | awk -v b="$BINARY" '$0==b || $0=="./"b {print; exit}')"
+MEMBER="$(tar -tzf "$WORKDIR/$ARCHIVE" \
+    | awk -v b="$BINARY" '$0==b || $0=="./"b { if (!m) m=$0 } END { if (m) print m }')"
 [ -n "$MEMBER" ] || { printf 'failed.\n'; fail "Executable '$BINARY' not found at the top level of the archive."; }
 tar -xzf "$WORKDIR/$ARCHIVE" -C "$WORKDIR" "$MEMBER"
 printf 'done.\n'
