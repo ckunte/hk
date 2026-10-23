@@ -1,0 +1,5 @@
+.gitattributes  export-ignore
+.gitignore      export-ignore
+*.png           export-ignore
+.github/        export-ignore
+inst.sh         export-ignore
