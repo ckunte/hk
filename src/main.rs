@@ -375,7 +375,16 @@ fn load_pdf(path: &Path) -> Result<Document> {
             path.display(), len >> 20, MAX_PDF_BYTES >> 20).into());
     }
     match std::panic::catch_unwind(|| Document::load(path)) {
-        Ok(Ok(doc)) => Ok(doc),
+        Ok(Ok(mut doc)) => {
+            // Files with an owner-only password open with an empty user password.
+            // Anything else would otherwise load as an empty document and be
+            // silently written back as a near-empty file.
+            if doc.is_encrypted() && doc.decrypt("").is_err() {
+                return Err(format!("{}: password-protected PDF (not supported)",
+                    path.display()).into());
+            }
+            Ok(doc)
+        }
         Ok(Err(e))  => Err(format!("{}: {}", path.display(), e).into()),
         Err(_)      => Err(format!("{}: malformed PDF (parser crashed)", path.display()).into()),
     }
@@ -539,31 +548,62 @@ fn obj_to_f64(obj: &Object) -> Result<f64> {
     }
 }
 
+/// Look up a page attribute, walking up the /Parent chain for inherited keys
+/// (MediaBox, CropBox, Rotate), and resolving indirect references.
+fn inherited_attr(doc: &Document, page_id: ObjectId, key: &[u8]) -> Option<Object> {
+    let mut id = page_id;
+    for _ in 0..64 {
+        let dict = doc.get_object(id).ok()?.as_dict().ok()?;
+        if let Ok(v) = dict.get(key) {
+            return match v {
+                Object::Reference(r) => doc.get_object(*r).ok().cloned(),
+                other => Some(other.clone()),
+            };
+        }
+        id = dict.get(b"Parent").ok()?.as_reference().ok()?;
+    }
+    None
+}
+
 fn crop_one_pdf(path: &Path, top_pts: f64, bott_pts: f64) -> Result<PathBuf> {
     let mut doc = load_pdf(path)?;
 
     let mut pages: Vec<(u32, ObjectId)> = doc.get_pages().into_iter().collect();
     pages.sort_by_key(|(n, _)| *n);
+    if pages.is_empty() {
+        return Err(format!("{}: no pages found", path.display()).into());
+    }
 
     for (page_num, page_id) in &pages {
-        let (x0, y0, x1, y1) = {
-            let obj  = doc.objects.get(page_id)
-                .ok_or_else(|| format!("page {}: object missing", page_num))?;
-            let dict = obj.as_dict()
-                .map_err(|_| format!("page {}: not a dictionary", page_num))?;
-            let arr  = dict.get(b"CropBox")
-                .or_else(|_| dict.get(b"MediaBox"))
-                .map_err(|_| format!("page {}: no MediaBox or CropBox found", page_num))?
-                .as_array()
-                .map_err(|_| format!("page {}: box is not an array", page_num))?;
-            if arr.len() < 4 {
-                return Err(format!("page {}: box has fewer than 4 elements", page_num).into());
+        let obj = inherited_attr(&doc, *page_id, b"CropBox")
+            .or_else(|| inherited_attr(&doc, *page_id, b"MediaBox"))
+            .ok_or_else(|| format!("page {}: no MediaBox or CropBox found", page_num))?;
+        let arr = obj.as_array()
+            .map_err(|_| format!("page {}: box is not an array", page_num))?;
+        if arr.len() < 4 {
+            return Err(format!("page {}: box has fewer than 4 elements", page_num).into());
+        }
+        let resolve = |o: &Object| -> Result<f64> {
+            match o {
+                Object::Reference(r) => obj_to_f64(doc.get_object(*r)?),
+                other => obj_to_f64(other),
             }
-            (obj_to_f64(&arr[0])?, obj_to_f64(&arr[1])?,
-             obj_to_f64(&arr[2])?, obj_to_f64(&arr[3])?)
         };
+        let (ax, ay, bx, by) = (resolve(&arr[0])?, resolve(&arr[1])?,
+                                resolve(&arr[2])?, resolve(&arr[3])?);
+        // Boxes may be given with corners in any order.
+        let (x0, x1) = (ax.min(bx), ax.max(bx));
+        let (y0, y1) = (ay.min(by), ay.max(by));
 
-        let height = y1 - y0;
+        // /Rotate turns the page clockwise when displayed, so "top" and
+        // "bottom" as the viewer sees them are not always the y-edges.
+        let rotate = match inherited_attr(&doc, *page_id, b"Rotate") {
+            Some(Object::Integer(r)) => r,
+            Some(Object::Real(r))    => r as i64,
+            _ => 0,
+        }.rem_euclid(360);
+
+        let height = if rotate == 90 || rotate == 270 { x1 - x0 } else { y1 - y0 };
         if top_pts + bott_pts >= height {
             return Err(format!(
                 "{}: page {}: combined crop ({:.2} + {:.2} = {:.2} pt) \
@@ -573,16 +613,25 @@ fn crop_one_pdf(path: &Path, top_pts: f64, bott_pts: f64) -> Result<PathBuf> {
             ).into());
         }
 
-        // PDF y-axis is bottom-up:
-        //   crop top  → lower y1  (y1 - top_pts)
-        //   crop bott → raise y0  (y0 + bott_pts)
+        // PDF y-axis is bottom-up. Visual top/bottom map to unrotated edges:
+        //   0   : top = y1, bottom = y0
+        //   90  : top = x0, bottom = x1
+        //   180 : top = y0, bottom = y1
+        //   270 : top = x1, bottom = x0
+        let (nx0, ny0, nx1, ny1) = match rotate {
+            90  => (x0 + top_pts, y0, x1 - bott_pts, y1),
+            180 => (x0, y0 + top_pts, x1, y1 - bott_pts),
+            270 => (x0 + bott_pts, y0, x1 - top_pts, y1),
+            _   => (x0, y0 + bott_pts, x1, y1 - top_pts),
+        };
+
         if let Some(obj) = doc.objects.get_mut(page_id) {
             if let Ok(dict) = obj.as_dict_mut() {
                 dict.set("CropBox", Object::Array(vec![
-                    Object::Real(x0 as f32),
-                    Object::Real((y0 + bott_pts) as f32),
-                    Object::Real(x1 as f32),
-                    Object::Real((y1 - top_pts) as f32),
+                    Object::Real(nx0 as f32),
+                    Object::Real(ny0 as f32),
+                    Object::Real(nx1 as f32),
+                    Object::Real(ny1 as f32),
                 ]));
             }
         }
