@@ -231,12 +231,16 @@ fn cmd_fffp(_flags: &[String]) -> Result<()> {
 // sffn — sanitise folder and file names
 //
 // Rules:
-//   • Replace spaces with underscores in all names
-//   • In directory names: replace every dot with an underscore
-//   • In document and media file stems (see SANITISE_EXTS): replace every dot
-//     with an underscore; the extension is lowercased
-//   • Hidden files (leading dot) and other file types are left alone
-//   • Strip trailing hyphens before the extension (e.g. "foo-.pdf")
+//   • Any run of one or more non-alphanumeric characters (spaces, "&", "_",
+//     "-", dots, punctuation, symbols, in any mix) becomes a single "-"
+//   • Leading and trailing "-" are trimmed from each name or file stem
+//   • Applies to directory names and to the stems of document and media files
+//     (see SANITISE_EXTS); the extension is lowercased
+//   • Compound archive extensions (.tar.gz, .tar.bz2, .tar.xz, ...) are kept
+//     intact; only the stem before them is cleaned
+//   • Dotfiles and dotfolders (leading dot), everything inside a dotfolder, and
+//     other file types are left alone
+//   • Case and accented letters are preserved
 //
 // File renames are parallelised; directory renames stay sequential
 // (deepest-first) so parent paths are not invalidated mid-run.
@@ -255,12 +259,55 @@ const SANITISE_EXTS: &[&str] = &[
     "mp4", "mov", "mkv", "avi", "webm", "m4v",
 ];
 
+/// Two-part archive extensions, kept intact (lowercased) instead of having the
+/// inner dot turned into '-'.  Matched case-insensitively against the name's end.
+const COMPOUND_EXTS: &[&str] = &[
+    "tar.gz", "tar.bz2", "tar.xz", "tar.zst", "tar.lz", "tar.lzma", "tar.z",
+];
+
+/// Split a file name into (stem, lowercase extension) if `sffn` handles its
+/// type: a compound archive extension first, otherwise the last extension if it
+/// is listed in SANITISE_EXTS.  Returns None for anything else.
+fn split_known_ext(name: &str) -> Option<(&str, String)> {
+    // to_ascii_lowercase keeps byte lengths, so slicing `name` by it is safe.
+    let lower = name.to_ascii_lowercase();
+    for c in COMPOUND_EXTS {
+        // Need at least one stem character before ".<ext>".
+        let Some(cut) = name.len().checked_sub(c.len() + 1).filter(|&n| n > 0) else { continue };
+        if lower.ends_with(c) && lower.as_bytes()[cut] == b'.' {
+            return Some((&name[..cut], (*c).to_owned()));
+        }
+    }
+    let dot = name.rfind('.').filter(|&i| i > 0 && i + 1 < name.len())?;
+    let ext = lower[dot + 1..].to_owned();
+    SANITISE_EXTS.contains(&ext.as_str()).then(|| (&name[..dot], ext))
+}
+
+/// Collapse every run of non-alphanumeric characters into a single '-', with
+/// no leading or trailing '-'.  Returns an empty string if nothing is left.
+fn collapse_separators(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut pending_sep = false;
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            if pending_sep && !out.is_empty() {
+                out.push('-');
+            }
+            pending_sep = false;
+            out.push(c);
+        } else {
+            pending_sep = true;
+        }
+    }
+    out
+}
+
 fn sanitize_dir_name(name: &str) -> String {
-    name.replace([' ', '\t', '.'], "_")
+    collapse_separators(name)
 }
 
 fn sanitize_file_stem(stem: &str) -> String {
-    sanitize_dir_name(stem).trim_end_matches(['-', '_']).to_owned()
+    collapse_separators(stem)
 }
 
 /// Plan `from` -> `parent/new_name` only when it is safe: the new name must be
@@ -285,6 +332,14 @@ fn plan_rename(
     Some((from.to_path_buf(), to))
 }
 
+/// True if any component of `path` below `root` is a dotfile or dotfolder.
+/// Such entries, and everything inside a dotfolder, are left alone by `sffn`.
+fn in_hidden(path: &Path, root: &Path) -> bool {
+    path.strip_prefix(root).unwrap_or(path).components().any(|c| {
+        c.as_os_str().to_str().is_some_and(|n| n.starts_with('.'))
+    })
+}
+
 fn cmd_sffn() -> Result<()> {
     let cwd = env::current_dir()?;
     let (dirs, files) = walk(&cwd);
@@ -296,15 +351,9 @@ fn cmd_sffn() -> Result<()> {
     // deterministically; only the (independent) execution is parallel.
     let mut file_plan: Vec<(PathBuf, PathBuf)> = Vec::new();
     for path in &files {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        if !SANITISE_EXTS.contains(&ext.as_str()) { continue; }
-        if path.file_name().and_then(|n| n.to_str()).map_or(true, |n| n.starts_with('.')) { continue; }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-        let old_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if in_hidden(path, &cwd) { continue; }
+        let Some(old_name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some((stem, ext)) = split_known_ext(old_name) else { continue };
         let new_name = format!("{}.{}", sanitize_file_stem(stem), ext);
         if new_name != old_name {
             if let Some(p) = plan_rename(path, &new_name, &mut claimed, &mut skipped) {
@@ -317,6 +366,7 @@ fn cmd_sffn() -> Result<()> {
     let mut dir_plan: Vec<(PathBuf, PathBuf)> = Vec::new();
     for path in &dirs {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if in_hidden(path, &cwd) { continue; } // leave .git, .cache, ... and their subfolders alone
         let new_name = sanitize_dir_name(name);
         if new_name != name {
             if let Some(p) = plan_rename(path, &new_name, &mut claimed, &mut skipped) {
@@ -742,5 +792,59 @@ fn main() {
     if let Err(e) = result {
         eprintln!("error: {}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod sffn_tests {
+    use super::{sanitize_dir_name as d, sanitize_file_stem as f};
+
+    #[test]
+    fn ampersand_and_spaces() {
+        assert_eq!(f("Tom & Jerry"), "Tom-Jerry");
+        assert_eq!(f("a   &   b"), "a-b");
+    }
+
+    #[test]
+    fn mixed_runs_collapse() {
+        assert_eq!(f("foo_-_bar"), "foo-bar");
+        assert_eq!(f("foo__bar"), "foo-bar");
+        assert_eq!(f("foo---bar"), "foo-bar");
+        assert_eq!(f("foo - bar (final)"), "foo-bar-final");
+    }
+
+    #[test]
+    fn trims_ends() {
+        assert_eq!(f("  -report_"), "report");
+        assert_eq!(d("(draft)"), "draft");
+    }
+
+    #[test]
+    fn dots_in_stems_and_dirs() {
+        assert_eq!(f("v1.2.3 notes"), "v1-2-3-notes");
+        assert_eq!(d("my.folder name"), "my-folder-name");
+    }
+
+    #[test]
+    fn keeps_case_and_accents() {
+        assert_eq!(f("Résumé 2026"), "Résumé-2026");
+    }
+
+    #[test]
+    fn nothing_left_is_empty() {
+        assert_eq!(f("&&&"), "");
+        assert_eq!(d("___"), "");
+    }
+
+    #[test]
+    fn compound_extensions_kept() {
+        use super::split_known_ext as k;
+        assert_eq!(k("My Backup.tar.gz"), Some(("My Backup", "tar.gz".to_string())));
+        assert_eq!(k("data v1.2.TAR.XZ"), Some(("data v1.2", "tar.xz".to_string())));
+        assert_eq!(k("a.b.pdf"), Some(("a.b", "pdf".to_string())));
+        assert_eq!(k("plain.gz"), None);      // single .gz is not a handled type
+        assert_eq!(k(".tar.gz"), None);       // no stem
+        assert_eq!(k("tar.gz"), None);        // no stem
+        assert_eq!(k("noext"), None);
     }
 }
