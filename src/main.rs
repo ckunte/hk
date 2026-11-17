@@ -10,7 +10,7 @@ use std::sync::{
     Mutex,
 };
 
-use lopdf::{dictionary, Document, Object, ObjectId};
+use lopdf::{dictionary, Document, Object, ObjectId, Stream};
 use rayon::prelude::*;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -26,6 +26,7 @@ r#"hk — housekeeping tools
 usage: hk <command> [argument]
 
 commands:
+  bgnd   add a background graphic to PDFs (--bott N inches, default 1.0; --svg file.svg)
   cmbi   combine all PDF files in the current folder
   cmbs   combine PDF files per subfolder
   crop   crop PDF header/footer (--top/--bott N inches, default 1.0)
@@ -615,6 +616,39 @@ fn inherited_attr(doc: &Document, page_id: ObjectId, key: &[u8]) -> Option<Objec
     None
 }
 
+/// Visible rectangle of a page as (x0, y0, x1, y1): its CropBox, or MediaBox if
+/// there is none.  Corners may be given in any order; the result is normalised.
+fn page_rect(doc: &Document, page_id: ObjectId, page_num: u32) -> Result<(f64, f64, f64, f64)> {
+    let obj = inherited_attr(doc, page_id, b"CropBox")
+        .or_else(|| inherited_attr(doc, page_id, b"MediaBox"))
+        .ok_or_else(|| format!("page {}: no MediaBox or CropBox found", page_num))?;
+    let arr = obj.as_array()
+        .map_err(|_| format!("page {}: box is not an array", page_num))?;
+    if arr.len() < 4 {
+        return Err(format!("page {}: box has fewer than 4 elements", page_num).into());
+    }
+    let resolve = |o: &Object| -> Result<f64> {
+        match o {
+            Object::Reference(r) => obj_to_f64(doc.get_object(*r)?),
+            other => obj_to_f64(other),
+        }
+    };
+    let (ax, ay, bx, by) = (resolve(&arr[0])?, resolve(&arr[1])?,
+                            resolve(&arr[2])?, resolve(&arr[3])?);
+    Ok((ax.min(bx), ay.min(by), ax.max(bx), ay.max(by)))
+}
+
+/// /Rotate of a page, normalised to 0..360.  It turns the page clockwise when
+/// displayed, so "top" and "bottom" as the viewer sees them are not always the
+/// y-edges.
+fn page_rotation(doc: &Document, page_id: ObjectId) -> i64 {
+    match inherited_attr(doc, page_id, b"Rotate") {
+        Some(Object::Integer(r)) => r,
+        Some(Object::Real(r))    => r as i64,
+        _ => 0,
+    }.rem_euclid(360)
+}
+
 fn crop_one_pdf(path: &Path, top_pts: f64, bott_pts: f64) -> Result<PathBuf> {
     let mut doc = load_pdf(path)?;
 
@@ -625,33 +659,8 @@ fn crop_one_pdf(path: &Path, top_pts: f64, bott_pts: f64) -> Result<PathBuf> {
     }
 
     for (page_num, page_id) in &pages {
-        let obj = inherited_attr(&doc, *page_id, b"CropBox")
-            .or_else(|| inherited_attr(&doc, *page_id, b"MediaBox"))
-            .ok_or_else(|| format!("page {}: no MediaBox or CropBox found", page_num))?;
-        let arr = obj.as_array()
-            .map_err(|_| format!("page {}: box is not an array", page_num))?;
-        if arr.len() < 4 {
-            return Err(format!("page {}: box has fewer than 4 elements", page_num).into());
-        }
-        let resolve = |o: &Object| -> Result<f64> {
-            match o {
-                Object::Reference(r) => obj_to_f64(doc.get_object(*r)?),
-                other => obj_to_f64(other),
-            }
-        };
-        let (ax, ay, bx, by) = (resolve(&arr[0])?, resolve(&arr[1])?,
-                                resolve(&arr[2])?, resolve(&arr[3])?);
-        // Boxes may be given with corners in any order.
-        let (x0, x1) = (ax.min(bx), ax.max(bx));
-        let (y0, y1) = (ay.min(by), ay.max(by));
-
-        // /Rotate turns the page clockwise when displayed, so "top" and
-        // "bottom" as the viewer sees them are not always the y-edges.
-        let rotate = match inherited_attr(&doc, *page_id, b"Rotate") {
-            Some(Object::Integer(r)) => r,
-            Some(Object::Real(r))    => r as i64,
-            _ => 0,
-        }.rem_euclid(360);
+        let (x0, y0, x1, y1) = page_rect(&doc, *page_id, *page_num)?;
+        let rotate = page_rotation(&doc, *page_id);
 
         let height = if rotate == 90 || rotate == 270 { x1 - x0 } else { y1 - y0 };
         if top_pts + bott_pts >= height {
@@ -767,6 +776,419 @@ fn cmd_crop(file_args: &[String]) -> Result<()> {
 
 
 // ---------------------------------------------------------------------------
+// bgnd — put a vector graphic behind the content of every page
+//
+// The graphic (an SVG, by default the bundled assets/footer.svg) is converted
+// to native PDF path operators, so it stays sharp at any zoom and adds only a
+// few KB per file.  On each page it is scaled uniformly (never stretched) to
+// the full visible width and sits flush on the bottom edge as the viewer sees
+// it, whatever the paper size or orientation, including /Rotate pages and
+// pages with a CropBox.  If a graphic were ever too tall for the page, it is
+// scaled down to fit the height and centred instead.
+//
+// The path data is written once per file as a shared content stream; each page
+// only gets a tiny stream holding its own placement matrix.
+//
+// Supported SVG subset: <path> elements with M/L/H/V/C/S/Z (absolute or
+// relative), fill, fill-rule, stroke, stroke-width and stroke-linejoin, with
+// hex colours.  Anything else (transforms, arcs, other shapes, ...) is reported
+// as an error rather than drawn wrongly.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_BG_SVG: &str = include_str!("../assets/footer.svg");
+
+/// A parsed graphic: its viewBox plus PDF content (in SVG user units, y down).
+struct Graphic {
+    min_x: f64,
+    min_y: f64,
+    width: f64,
+    height: f64,
+    content: String,
+}
+
+/// Format a number for a PDF content stream: at most 4 decimals, no exponent.
+fn pdf_num(v: f64) -> String {
+    let t = format!("{:.4}", v);
+    let t = t.trim_end_matches('0').trim_end_matches('.');
+    if t.is_empty() || t == "-0" { "0".to_owned() } else { t.to_owned() }
+}
+
+/// Value of attribute `name` in a tag's text, e.g. attr(r#"<path d="M0 0"/>"#, "d").
+fn svg_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let mut from = 0;
+    while let Some(pos) = tag[from..].find(name) {
+        let at = from + pos;
+        let after = &tag[at + name.len()..];
+        let boundary = at == 0
+            || tag[..at].ends_with(|c: char| c.is_ascii_whitespace());
+        if boundary && after.starts_with('=') {
+            let rest = &after[1..];
+            let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+            let body = &rest[1..];
+            return body.find(quote).map(|end| &body[..end]);
+        }
+        from = at + name.len();
+    }
+    None
+}
+
+/// "#rgb" or "#rrggbb" -> "r g b" in 0..1.  `none` -> Ok(None).
+fn svg_color(v: &str) -> Result<Option<String>> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("none") { return Ok(None); }
+    let hex = v.strip_prefix('#').ok_or_else(|| format!("unsupported colour '{}' (use #rrggbb)", v))?;
+    let full: String = match hex.len() {
+        3 => hex.chars().flat_map(|c| [c, c]).collect(),
+        6 => hex.to_owned(),
+        _ => return Err(format!("unsupported colour '{}' (use #rrggbb)", v).into()),
+    };
+    let n = u32::from_str_radix(&full, 16).map_err(|_| format!("bad colour '{}'", v))?;
+    let ch = |shift: u32| pdf_num(((n >> shift) & 0xff) as f64 / 255.0);
+    Ok(Some(format!("{} {} {}", ch(16), ch(8), ch(0))))
+}
+
+/// Convert SVG path data into PDF path operators (no painting operator).
+fn svg_path_to_pdf(d: &str) -> Result<String> {
+    let b = d.as_bytes();
+    let mut i = 0usize;
+    let mut out = String::with_capacity(d.len() + d.len() / 4);
+    let (mut cx, mut cy) = (0.0f64, 0.0f64);
+    let (mut sx, mut sy) = (0.0f64, 0.0f64);
+    let mut last_c2: Option<(f64, f64)> = None;
+    let mut have_point = false;
+    let mut cmd: u8 = 0;
+
+    fn skip_sep(b: &[u8], i: &mut usize) {
+        while *i < b.len() && (b[*i].is_ascii_whitespace() || b[*i] == b',') { *i += 1; }
+    }
+    fn number(b: &[u8], i: &mut usize) -> Result<f64> {
+        skip_sep(b, i);
+        let start = *i;
+        if *i < b.len() && (b[*i] == b'+' || b[*i] == b'-') { *i += 1; }
+        let mut digits = 0;
+        while *i < b.len() && b[*i].is_ascii_digit() { *i += 1; digits += 1; }
+        if *i < b.len() && b[*i] == b'.' {
+            *i += 1;
+            while *i < b.len() && b[*i].is_ascii_digit() { *i += 1; digits += 1; }
+        }
+        if digits == 0 { return Err(format!("bad number in path data near byte {}", start).into()); }
+        if *i < b.len() && (b[*i] == b'e' || b[*i] == b'E') {
+            let mark = *i;
+            *i += 1;
+            if *i < b.len() && (b[*i] == b'+' || b[*i] == b'-') { *i += 1; }
+            let exp_start = *i;
+            while *i < b.len() && b[*i].is_ascii_digit() { *i += 1; }
+            if *i == exp_start { *i = mark; } // not an exponent after all
+        }
+        std::str::from_utf8(&b[start..*i]).unwrap().parse::<f64>()
+            .map_err(|_| format!("bad number in path data near byte {}", start).into())
+    }
+
+    loop {
+        skip_sep(b, &mut i);
+        if i >= b.len() { break; }
+        if b[i].is_ascii_alphabetic() {
+            cmd = b[i];
+            i += 1;
+            if !matches!(cmd, b'M'|b'm'|b'L'|b'l'|b'H'|b'h'|b'V'|b'v'|b'C'|b'c'|b'S'|b's'|b'Z'|b'z') {
+                return Err(format!("unsupported path command '{}' (supported: M L H V C S Z)",
+                    cmd as char).into());
+            }
+            if matches!(cmd, b'Z' | b'z') {
+                if !have_point { return Err("path data: 'Z' before any 'M'".into()); }
+                out.push_str("h\n");
+                cx = sx; cy = sy;
+                last_c2 = None;
+                continue;
+            }
+        } else if cmd == 0 {
+            return Err("path data must start with a command".into());
+        } else if matches!(cmd, b'Z' | b'z') {
+            return Err("path data: numbers after 'Z' without a command".into());
+        }
+        let rel = cmd.is_ascii_lowercase();
+        let (ox, oy) = if rel { (cx, cy) } else { (0.0, 0.0) };
+        match cmd.to_ascii_uppercase() {
+            b'M' => {
+                let (x, y) = (ox + number(b, &mut i)?, oy + number(b, &mut i)?);
+                out.push_str(&format!("{} {} m\n", pdf_num(x), pdf_num(y)));
+                cx = x; cy = y; sx = x; sy = y;
+                have_point = true;
+                last_c2 = None;
+                cmd = if rel { b'l' } else { b'L' }; // further pairs are implicit lineto
+            }
+            c if !have_point => {
+                return Err(format!("path data: '{}' before any 'M'", c as char).into());
+            }
+            b'L' => {
+                let (x, y) = (ox + number(b, &mut i)?, oy + number(b, &mut i)?);
+                out.push_str(&format!("{} {} l\n", pdf_num(x), pdf_num(y)));
+                cx = x; cy = y;
+                last_c2 = None;
+            }
+            b'H' => {
+                let x = ox + number(b, &mut i)?;
+                out.push_str(&format!("{} {} l\n", pdf_num(x), pdf_num(cy)));
+                cx = x;
+                last_c2 = None;
+            }
+            b'V' => {
+                let y = oy + number(b, &mut i)?;
+                out.push_str(&format!("{} {} l\n", pdf_num(cx), pdf_num(y)));
+                cy = y;
+                last_c2 = None;
+            }
+            b'C' => {
+                let x1 = ox + number(b, &mut i)?; let y1 = oy + number(b, &mut i)?;
+                let x2 = ox + number(b, &mut i)?; let y2 = oy + number(b, &mut i)?;
+                let x  = ox + number(b, &mut i)?; let y  = oy + number(b, &mut i)?;
+                out.push_str(&format!("{} {} {} {} {} {} c\n",
+                    pdf_num(x1), pdf_num(y1), pdf_num(x2), pdf_num(y2), pdf_num(x), pdf_num(y)));
+                last_c2 = Some((x2, y2));
+                cx = x; cy = y;
+            }
+            b'S' => {
+                // First control point reflects the previous curve's second one.
+                let (x1, y1) = match last_c2 { Some((px, py)) => (2.0 * cx - px, 2.0 * cy - py), None => (cx, cy) };
+                let x2 = ox + number(b, &mut i)?; let y2 = oy + number(b, &mut i)?;
+                let x  = ox + number(b, &mut i)?; let y  = oy + number(b, &mut i)?;
+                out.push_str(&format!("{} {} {} {} {} {} c\n",
+                    pdf_num(x1), pdf_num(y1), pdf_num(x2), pdf_num(y2), pdf_num(x), pdf_num(y)));
+                last_c2 = Some((x2, y2));
+                cx = x; cy = y;
+            }
+            _ => unreachable!(),
+        }
+    }
+    if !have_point { return Err("empty path data".into()); }
+    Ok(out)
+}
+
+/// Parse the supported SVG subset into PDF content.
+fn parse_svg(src: &str) -> Result<Graphic> {
+    let mut view: Option<(f64, f64, f64, f64)> = None;
+    let mut content = String::new();
+    let mut paths = 0usize;
+
+    let mut rest = src;
+    while let Some(lt) = rest.find('<') {
+        rest = &rest[lt..];
+        if rest.starts_with("<?") || rest.starts_with("<!--") || rest.starts_with("<!") {
+            let close = if rest.starts_with("<!--") { "-->" } else { ">" };
+            let end = rest.find(close).ok_or("unterminated markup in SVG")?;
+            rest = &rest[end + close.len()..];
+            continue;
+        }
+        let end = rest.find('>').ok_or("unterminated tag in SVG")?;
+        let tag = &rest[..=end];
+        rest = &rest[end + 1..];
+        let name: String = tag[1..].chars().take_while(|c| !c.is_whitespace() && *c != '>' && *c != '/').collect();
+        if name.starts_with('/') || name.is_empty() { continue; }
+        if svg_attr(tag, "transform").is_some() {
+            return Err("SVG transform attributes are not supported".into());
+        }
+        match name.as_str() {
+            "svg" => {
+                let vb = svg_attr(tag, "viewBox").ok_or("SVG has no viewBox")?;
+                let n: Vec<f64> = vb.split(|c: char| c.is_whitespace() || c == ',')
+                    .filter(|t| !t.is_empty())
+                    .map(|t| t.parse::<f64>().map_err(|_| format!("bad viewBox '{}'", vb)))
+                    .collect::<std::result::Result<_, _>>()?;
+                if n.len() != 4 || n[2] <= 0.0 || n[3] <= 0.0 {
+                    return Err(format!("bad viewBox '{}'", vb).into());
+                }
+                view = Some((n[0], n[1], n[2], n[3]));
+            }
+            "path" => {
+                let d = svg_attr(tag, "d").ok_or("<path> without a 'd' attribute")?;
+                let ops = svg_path_to_pdf(d)?;
+                let fill = match svg_attr(tag, "fill") {
+                    Some(v) => svg_color(v)?,
+                    None => Some("0 0 0".to_owned()), // SVG default is black
+                };
+                let stroke = match svg_attr(tag, "stroke") { Some(v) => svg_color(v)?, None => None };
+                let evenodd = svg_attr(tag, "fill-rule").is_some_and(|v| v.trim() == "evenodd");
+                if let Some(c) = &fill { content.push_str(&format!("{} rg\n", c)); }
+                if let Some(c) = &stroke {
+                    let w: f64 = svg_attr(tag, "stroke-width")
+                        .map(|v| v.trim().parse().map_err(|_| format!("bad stroke-width '{}'", v)))
+                        .transpose()?
+                        .unwrap_or(1.0);
+                    let join = match svg_attr(tag, "stroke-linejoin").map(str::trim) {
+                        Some("round") => 1, Some("bevel") => 2, _ => 0,
+                    };
+                    content.push_str(&format!("{} RG {} w {} j\n", c, pdf_num(w), join));
+                }
+                content.push_str(&ops);
+                content.push_str(match (fill.is_some(), stroke.is_some(), evenodd) {
+                    (true,  true,  false) => "B\n",
+                    (true,  true,  true)  => "B*\n",
+                    (true,  false, false) => "f\n",
+                    (true,  false, true)  => "f*\n",
+                    (false, true,  _)     => "S\n",
+                    (false, false, _)     => "n\n",
+                });
+                paths += 1;
+            }
+            "title" | "desc" => {}
+            other => return Err(format!("unsupported SVG element <{}> (only <path> is drawn)", other).into()),
+        }
+    }
+
+    let (min_x, min_y, width, height) = view.ok_or("no <svg> element found")?;
+    if paths == 0 { return Err("SVG contains no <path> elements".into()); }
+    Ok(Graphic { min_x, min_y, width, height, content })
+}
+
+/// Matrix [a b c d e f] placing the graphic on a visible page rectangle
+/// (x0, y0, x1, y1) with /Rotate `rotate`: uniformly scaled to the visible
+/// width (or to the height if that is smaller), centred sideways, flush with
+/// the bottom edge as displayed (raised by `lift` points), and upright as
+/// displayed.
+fn bg_matrix(rect: (f64, f64, f64, f64), rotate: i64, g: &Graphic, lift: f64) -> Result<[f64; 6]> {
+    let (x0, y0, x1, y1) = rect;
+    let (w, h) = match rotate {
+        90 | 270 => (y1 - y0, x1 - x0),
+        _        => (x1 - x0, y1 - y0),
+    };
+    if w <= 0.0 || h <= 0.0 { return Err("page has an empty visible area".into()); }
+    if lift >= h { return Err(format!("offset {:.2} pt is not less than page height {:.2} pt", lift, h).into()); }
+    let s = (w / g.width).min((h - lift) / g.height);
+    // Displayed point (vx right, vy up from bottom-left) from SVG point (sx, sy):
+    //   vx = s*sx + tx,  vy = -s*sy + ty
+    let tx = (w - g.width * s) / 2.0 - s * g.min_x;
+    let ty = s * (g.min_y + g.height) + lift;
+    // Displayed -> user space:  ux = ax*vx + bx*vy + cx,  uy = ay*vx + by*vy + cy
+    let (ax, bx, cx, ay, by, cy) = match rotate {
+        90  => (0.0, -1.0, x1,  1.0,  0.0, y0),
+        180 => (-1.0, 0.0, x1,  0.0, -1.0, y1),
+        270 => (0.0,  1.0, x0, -1.0,  0.0, y1),
+        _   => (1.0,  0.0, x0,  0.0,  1.0, y0),
+    };
+    Ok([
+        ax * s, ay * s, -bx * s, -by * s,
+        ax * tx + bx * ty + cx,
+        ay * tx + by * ty + cy,
+    ])
+}
+
+fn bgnd_one_pdf(path: &Path, g: &Graphic, lift: f64) -> Result<PathBuf> {
+    let mut doc = load_pdf(path)?;
+
+    let mut pages: Vec<(u32, ObjectId)> = doc.get_pages().into_iter().collect();
+    pages.sort_by_key(|(n, _)| *n);
+    if pages.is_empty() {
+        return Err(format!("{}: no pages found", path.display()).into());
+    }
+
+    // One shared stream of paths and one shared "Q"; per page only a short
+    // "q <matrix> cm" stream, so the file grows by a single copy of the graphic.
+    let paths_id = doc.add_object(Stream::new(dictionary! {}, g.content.clone().into_bytes()));
+    let close_id = doc.add_object(Stream::new(dictionary! {}, b"Q\n".to_vec()));
+
+    for (page_num, page_id) in &pages {
+        let rect = page_rect(&doc, *page_id, *page_num)?;
+        let rotate = page_rotation(&doc, *page_id);
+        let m = bg_matrix(rect, rotate, g, lift)
+            .map_err(|e| format!("{}: page {}: {}", path.display(), page_num, e))?;
+        let open = format!("q {} cm\n", m.iter().map(|v| pdf_num(*v)).collect::<Vec<_>>().join(" "));
+        let open_id = doc.add_object(Stream::new(dictionary! {}, open.into_bytes()));
+
+        // The existing /Contents may be absent, a stream, or an array (directly
+        // or via a reference).  The background goes first, so it is drawn behind.
+        let existing: Vec<Object> = match doc.get_object(*page_id)?.as_dict()?.get(b"Contents") {
+            Ok(Object::Reference(r)) => match doc.get_object(*r) {
+                Ok(Object::Array(a)) => a.clone(),
+                _ => vec![Object::Reference(*r)],
+            },
+            Ok(Object::Array(a)) => a.clone(),
+            _ => vec![],
+        };
+        let mut contents = vec![
+            Object::Reference(open_id),
+            Object::Reference(paths_id),
+            Object::Reference(close_id),
+        ];
+        contents.extend(existing);
+        doc.get_object_mut(*page_id)?.as_dict_mut()?.set("Contents", Object::Array(contents));
+    }
+
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+    let out  = path.with_file_name(format!("{}-bg.pdf", stem));
+    doc.compress();
+    doc.save(&out)
+        .map_err(|e| format!("{}: save failed: {}", out.display(), e))?;
+    Ok(out)
+}
+
+fn cmd_bgnd(args: &[String]) -> Result<()> {
+    let mut svg_path: Option<PathBuf> = None;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut bott: f64 = 1.0;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bott" => {
+                i += 1;
+                bott = args.get(i)
+                    .ok_or("--bott: missing value")?
+                    .parse::<f64>()
+                    .map_err(|_| "--bott: value must be a number")?;
+                if !(bott >= 0.0) { return Err("--bott: must be non-negative".into()); }
+            }
+            "--svg" => {
+                i += 1;
+                svg_path = Some(PathBuf::from(args.get(i).ok_or("--svg: missing file name")?));
+            }
+            a if a.starts_with("--") => return Err(format!("bgnd: unknown option '{}'", a).into()),
+            a => paths.push(PathBuf::from(a)),
+        }
+        i += 1;
+    }
+
+    if paths.is_empty() {
+        return Err(
+            "bgnd: no PDF files specified.\n\
+             Usage: hk bgnd [--bott N] [--svg graphic.svg] file.pdf [...]".into()
+        );
+    }
+
+    let graphic = match &svg_path {
+        Some(p) => {
+            let src = fs::read_to_string(p).map_err(|e| format!("{}: {}", p.display(), e))?;
+            parse_svg(&src).map_err(|e| format!("{}: {}", p.display(), e))?
+        }
+        None => parse_svg(DEFAULT_BG_SVG)?,
+    };
+
+    println!("Adding background to {} file{} — {:.2}\" from bottom", paths.len(), s(paths.len()), bott);
+
+    let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let count = AtomicUsize::new(0);
+
+    paths.par_iter().for_each(|path| {
+        match bgnd_one_pdf(path, &graphic, bott * 72.0) {
+            Ok(out) => {
+                count.fetch_add(1, Ordering::Relaxed);
+                println!("  {}", out.display());
+            }
+            Err(e) => { errors.lock().unwrap().push(e.to_string()); }
+        }
+    });
+
+    let n = count.load(Ordering::Relaxed);
+    println!("Done: {}/{} file{} updated.", n, paths.len(), s(paths.len()));
+    let errors = errors.into_inner().unwrap();
+    let failed = errors.len();
+    warn_all(errors);
+    if failed > 0 {
+        return Err(format!("{} file{} failed", failed, s(failed)).into());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -776,6 +1198,7 @@ fn main() {
     let rest = args.get(2..).unwrap_or(&[]);
 
     let result: Result<()> = match cmd {
+        "bgnd" => cmd_bgnd(rest),
         "cmbi" => cmd_cmbi(),
         "cmbs" => cmd_cmbs(),
         "crop" => cmd_crop(rest),
@@ -847,4 +1270,156 @@ mod sffn_tests {
         assert_eq!(k("tar.gz"), None);        // no stem
         assert_eq!(k("noext"), None);
     }
+}
+
+#[cfg(test)]
+mod bgnd_tests {
+    use super::*;
+
+    fn g(w: f64, h: f64) -> Graphic {
+        Graphic { min_x: 0.0, min_y: 0.0, width: w, height: h, content: String::new() }
+    }
+    /// Apply a PDF matrix to the SVG point (x, y).
+    fn at(m: &[f64; 6], x: f64, y: f64) -> (f64, f64) {
+        (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5])
+    }
+    fn close(a: (f64, f64), b: (f64, f64)) {
+        assert!((a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6, "{:?} != {:?}", a, b);
+    }
+
+    #[test]
+    fn path_commands() {
+        assert_eq!(svg_path_to_pdf("M10 20L30 40Z").unwrap(), "10 20 m
+30 40 l
+h
+");
+        // relative commands, implicit repeats, packed signs and decimals
+        assert_eq!(svg_path_to_pdf("m1,1 2 2-1-1").unwrap(), "1 1 m
+3 3 l
+2 2 l
+");
+        assert_eq!(svg_path_to_pdf("M0 0h5v5H0z").unwrap(), "0 0 m
+5 0 l
+5 5 l
+0 5 l
+h
+");
+        assert_eq!(svg_path_to_pdf("M0 0C1 1 2 2 3 3 4 4 5 5 6 6").unwrap(),
+            "0 0 m
+1 1 2 2 3 3 c
+4 4 5 5 6 6 c
+");
+        assert_eq!(svg_path_to_pdf("M1.5.5l.5.5").unwrap(), "1.5 0.5 m
+2 1 l
+");
+        // S reflects the previous control point
+        assert_eq!(svg_path_to_pdf("M0 0C0 1 1 2 2 2S4 3 4 2").unwrap(),
+            "0 0 m
+0 1 1 2 2 2 c
+3 2 4 3 4 2 c
+");
+        // Z returns to the subpath start for relative moves
+        assert_eq!(svg_path_to_pdf("M5 5l1 0zl1 1").unwrap(), "5 5 m
+6 5 l
+h
+6 6 l
+");
+    }
+
+    #[test]
+    fn path_errors() {
+        assert!(svg_path_to_pdf("M0 0A1 1 0 0 1 2 2").is_err());
+        assert!(svg_path_to_pdf("L1 1").is_err());
+        assert!(svg_path_to_pdf("M0").is_err());
+        assert!(svg_path_to_pdf("").is_err());
+    }
+
+    #[test]
+    fn colours() {
+        assert_eq!(svg_color("#ff0000").unwrap().unwrap(), "1 0 0");
+        assert_eq!(svg_color("#0f0").unwrap().unwrap(), "0 1 0");
+        assert!(svg_color("none").unwrap().is_none());
+        assert!(svg_color("red").is_err());
+    }
+
+    #[test]
+    fn bundled_graphic_parses() {
+        let g = parse_svg(DEFAULT_BG_SVG).unwrap();
+        assert_eq!((g.width, g.height), (1862.0, 644.0));
+        assert_eq!(g.content.matches("B*\n").count(), 2);
+        assert!(g.content.contains("0.9961 0.8353 0.3216 rg"));
+    }
+
+    #[test]
+    fn rejects_unsupported_svg() {
+        assert!(parse_svg(r#"<svg viewBox="0 0 1 1"><circle r="1"/></svg>"#).is_err());
+        assert!(parse_svg(r#"<svg viewBox="0 0 1 1"><path d="M0 0L1 1" transform="scale(2)"/></svg>"#).is_err());
+        assert!(parse_svg(r#"<svg><path d="M0 0L1 1"/></svg>"#).is_err());
+    }
+
+    #[test]
+    fn upright_and_flush_with_displayed_bottom() {
+        // A4 portrait graphic 1862x644: spans the full width, flush at the bottom.
+        let (w, h) = (595.0, 842.0);
+        let gr = g(1862.0, 644.0);
+        let s = w / 1862.0;
+        let m = bg_matrix((0.0, 0.0, w, h), 0, &gr, 0.0).unwrap();
+        close(at(&m, 0.0, 644.0), (0.0, 0.0));
+        close(at(&m, 1862.0, 644.0), (w, 0.0));
+        close(at(&m, 0.0, 0.0), (0.0, 644.0 * s));
+
+        // 90 deg: displayed bottom is the x1 edge; displayed left is y0.
+        let m = bg_matrix((0.0, 0.0, w, h), 90, &gr, 0.0).unwrap();
+        let s = h / 1862.0;
+        close(at(&m, 0.0, 644.0), (w, 0.0));
+        close(at(&m, 1862.0, 644.0), (w, h));
+        close(at(&m, 0.0, 0.0), (w - 644.0 * s, 0.0));
+
+        // 180 deg
+        let m = bg_matrix((0.0, 0.0, w, h), 180, &gr, 0.0).unwrap();
+        let s = w / 1862.0;
+        close(at(&m, 0.0, 644.0), (w, h));
+        close(at(&m, 1862.0, 644.0), (0.0, h));
+        close(at(&m, 0.0, 0.0), (w, h - 644.0 * s));
+
+        // 270 deg: displayed bottom is the x0 edge; displayed left is y1.
+        let m = bg_matrix((0.0, 0.0, w, h), 270, &gr, 0.0).unwrap();
+        let s = h / 1862.0;
+        close(at(&m, 0.0, 644.0), (0.0, h));
+        close(at(&m, 1862.0, 644.0), (0.0, 0.0));
+        close(at(&m, 0.0, 0.0), (644.0 * s, h));
+    }
+
+    #[test]
+    fn uniform_scale_and_offset_boxes() {
+        // Non-zero origin (CropBox) and aspect preserved.
+        let gr = g(1862.0, 644.0);
+        let m = bg_matrix((10.0, 20.0, 110.0, 220.0), 0, &gr, 0.0).unwrap();
+        assert!((m[0] + m[3]).abs() < 1e-9 && m[1] == 0.0 && m[2] == 0.0);
+        close(at(&m, 0.0, 644.0), (10.0, 20.0));
+        close(at(&m, 1862.0, 644.0), (110.0, 20.0));
+        // A graphic too tall for the page is fitted to the height and centred.
+        let tall = g(100.0, 400.0);
+        let m = bg_matrix((0.0, 0.0, 200.0, 100.0), 0, &tall, 0.0).unwrap();
+        close(at(&m, 0.0, 400.0), (87.5, 0.0));
+        close(at(&m, 100.0, 0.0), (112.5, 100.0));
+    }
+
+    #[test]
+    fn lift_raises_from_displayed_bottom() {
+        let gr = g(1862.0, 644.0);
+        let (w, h) = (595.0, 842.0);
+        let m = bg_matrix((0.0, 0.0, w, h), 0, &gr, 36.0).unwrap();
+        close(at(&m, 0.0, 644.0), (0.0, 36.0));
+        close(at(&m, 1862.0, 644.0), (w, 36.0));
+        // rotated 90: displayed bottom is the x1 edge, so it moves to x1 - lift
+        let m = bg_matrix((0.0, 0.0, w, h), 90, &gr, 36.0).unwrap();
+        close(at(&m, 0.0, 644.0), (w - 36.0, 0.0));
+        // a graphic that no longer fits above the offset shrinks to stay on the page
+        let tall = g(100.0, 400.0);
+        let m = bg_matrix((0.0, 0.0, 200.0, 100.0), 0, &tall, 50.0).unwrap();
+        close(at(&m, 0.0, 0.0), (barely(&m), 100.0));
+        assert!(bg_matrix((0.0, 0.0, w, h), 0, &gr, h).is_err());
+    }
+    fn barely(m: &[f64; 6]) -> f64 { m[4] }
 }
