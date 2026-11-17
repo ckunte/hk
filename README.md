@@ -1,6 +1,6 @@
 # hkp
 
-A collection of housekeeping tools to manage files and folders, set permissions, combine and crop PDF files — packaged as a single `hk` binary written in Rust.
+A collection of housekeeping tools to manage files and folders, set permissions, combine, crop and add backgrounds to PDF files — packaged as a single `hk` binary written in Rust.
 
 ## usage
 
@@ -10,6 +10,7 @@ hk — housekeeping tools
 usage: hk <command> [argument]
 
 commands:
+  bgnd   add a background graphic to PDFs (--bott N inches, default 1.0; --svg file.svg)
   cmbi   combine all PDF files in the current folder
   cmbs   combine PDF files per subfolder
   crop   crop PDF header/footer (--top/--bott N inches, default 1.0)
@@ -27,6 +28,16 @@ For a single file, the command can simply be:
 ```sh
 hk crop --top 1.5 --bott 0.5 file.pdf
 ```
+
+`bgnd` puts a graphic behind the content of every page of one or more PDFs, writing `<name>-bg.pdf` next to each:
+
+```sh
+hk bgnd note.pdf report.pdf       # 1.0" above the bottom edge (default)
+hk bgnd --bott 0 note.pdf          # flush with the bottom edge
+hk bgnd --bott 0.5 note.pdf        # 0.5" above the bottom edge
+hk bgnd --svg my-footer.svg note.pdf
+```
+The graphic (by default the bundled `assets/footer.svg`) is scaled uniformly to the page's full visible width and sits flush on the bottom edge (`--bott N` inches above it, default 1.0 like `crop`; use `--bott 0` for flush), so it is never distorted and works for any paper size, orientation, rotated page or CropBox.
 
 ## install
 
@@ -85,6 +96,8 @@ None — `hk` is a single self-contained binary.
 - `sffn` skips any rename whose target already exists, and reports it
 - `sffn` sanitises folder names and the names of document (pdf, doc/docx, typ, xls/xlsx, ppt/pptx, odt/ods/odp, rtf, txt, md, csv, epub, pages/numbers/key), image (jpg, png, gif, webp, heic, tiff, bmp, svg), audio (mp3, wav, flac, m4a, aac, ogg) and video (mp4, mov, mkv, avi, webm, m4v) files natively — no fd, detox, or rename needed. Other files and hidden files are left alone. The list is `SANITISE_EXTS` in `src/main.rs`
 - `fffp` is pure Rust — no shell tools needed (macOS / Linux only; not available on Windows). It asks for confirmation (`--yes` to skip), refuses to run in `/` or your home folder, keeps the executable bit on files that already have it (755), and skips private entries with no group/other access (such as 600 keys) unless you pass `--all`
+
+- `bgnd` draws the SVG as native PDF vector paths (sharp at any zoom, a few KB added per file; the paths are stored once per file, not per page). Supported SVG: `<path>` with M/L/H/V/C/S/Z, `#hex` fill/stroke, fill-rule, stroke-width, stroke-linejoin; anything else (transforms, arcs, other shapes) is reported as an error. Pages that paint an opaque background of their own will cover it
 
 ## releases
 
