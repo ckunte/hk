@@ -1,4 +1,4 @@
-# hkp
+# hk
 
 A collection of housekeeping tools to manage files and folders, set permissions, combine, crop and add backgrounds to PDF files — packaged as a single `hk` binary written in Rust.
 
