@@ -10,7 +10,7 @@ hk — housekeeping tools
 usage: hk <command> [argument]
 
 commands:
-  bgnd   add a background graphic to PDFs (--bott N inches, default 1.0; --svg file.svg)
+  bgnd   add a background to PDFs (--bott N inches, default 1.0; --svg file.svg)
   cmbi   combine all PDF files in the current folder
   cmbs   combine PDF files per subfolder
   crop   crop PDF header/footer (--top/--bott N inches, default 1.0)
